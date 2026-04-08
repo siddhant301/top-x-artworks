@@ -1,25 +1,86 @@
 import httpx
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # The chart_data_formatter module remains at the top level
 import sys
-import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from chart_data_formatter import format_chart_data_for_llm
+from services.chart_data_formatter import format_chart_data_for_llm
+from services.mutualart_auth import get_auth_manager
 
 GRAPHQL_URL = "https://gql.test.mutualart.com/api/graphql"
 
-# In a production app, AUTH_TOKEN should ideally be in .env, but keeping as requested
-AUTH_TOKEN = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InNpZGRoYW50QG11dHVhbGFydC5jb20iLCJwbGF0Zm9ybSI6ImNvbnNvbGUiLCJleHAiOjI0MDYwNjcyMDAsImlzcyI6Imh0dHBzOi8vbG9jYWxob3N0OjcyMzAifQ.i6yrRM5X8LqCki9uXNHriDaC_xgCxk7ANf9NB-tmtwQ"
 
-def get_client() -> httpx.AsyncClient:
-    """Create a configured httpx AsyncClient to reuse connections."""
+async def get_client(force_refresh: bool = False) -> httpx.AsyncClient:
+    """Create a configured httpx AsyncClient with a valid MutualArt token."""
+    auth_manager = get_auth_manager()
     headers = {
-        "Authorization": AUTH_TOKEN,
-        "Content-Type": "application/json"
+        "Authorization": await auth_manager.get_authorization_header(force_refresh=force_refresh),
+        "Content-Type": "application/json",
     }
-    return httpx.AsyncClient(verify=False, headers=headers, timeout=30.0)
+    return httpx.AsyncClient(
+        verify=auth_manager.verify_ssl,
+        headers=headers,
+        timeout=auth_manager.timeout_seconds,
+    )
+
+
+def _is_auth_related_graphql_error(data: dict) -> bool:
+    errors = data.get("errors")
+    if not errors:
+        return False
+
+    if isinstance(errors, list):
+        flattened = " ".join(
+            json.dumps(item, ensure_ascii=False) if not isinstance(item, str) else item for item in errors
+        )
+    else:
+        flattened = str(errors)
+
+    lowered = flattened.lower()
+    auth_markers = (
+        "invalid_token",
+        "authorization",
+        "unauthorized",
+        "forbidden",
+        "not authorized",
+        "jwt",
+        "token",
+    )
+    return any(marker in lowered for marker in auth_markers)
+
+
+async def _refresh_client_auth_header(client: httpx.AsyncClient) -> None:
+    auth_manager = get_auth_manager()
+    client.headers["Authorization"] = await auth_manager.get_authorization_header(force_refresh=True)
+
+
+async def _execute_graphql_request(client: httpx.AsyncClient, query: str, variables: dict) -> dict:
+    for attempt in range(2):
+        response = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables})
+
+        if response.status_code in (401, 403):
+            if attempt == 0:
+                await _refresh_client_auth_header(client)
+                continue
+            response.raise_for_status()
+
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            if attempt == 0 and _is_auth_related_graphql_error(data):
+                await _refresh_client_auth_header(client)
+                continue
+            raise Exception(f"GraphQL Errors: {data['errors']}")
+
+        return data
+
+    raise Exception("GraphQL request failed after one auth refresh retry.")
 
 async def fetch_top_5_expensive(client: httpx.AsyncClient, artist_id):
     """
@@ -38,13 +99,7 @@ async def fetch_top_5_expensive(client: httpx.AsyncClient, artist_id):
         "_artists": [artist_id]
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     artworks = data.get('data', {}).get('artworks', {}).get('data', [])
     return [aw['id'] for aw in artworks]
 
@@ -128,13 +183,7 @@ async def fetch_artwork_details(client: httpx.AsyncClient, artwork_ids):
         "_skip": 0
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     return data.get('data', {}).get('data', {}).get('data', [])
 
 def build_prompt_context(artworks):
@@ -296,94 +345,99 @@ async def fetch_chart_data(client: httpx.AsyncClient, artist_id):
       }
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     return data
 
 async def build_article_prompt(artist_id):
     """
     Main entry point for generating the prompt text using httpx.AsyncClient for performance.
     """
-    # Use context manager to automatically close the session once we're done
-    async with get_client() as client:
+    async with await get_client() as client:
         # 1. Fetch Top 5 IDs
         top_ids = await fetch_top_5_expensive(client, artist_id)
         if not top_ids:
             return None
-            
+
         # 2. Fetch Detailed Artwork Fields
         details = await fetch_artwork_details(client, top_ids)
         if not details:
             return None
-            
+
         # 3. Build the JSON string and extract artist name
         context_str, artist_name = build_prompt_context(details)
-        
+
         # 4. Fetch Chart Data
         chart_data_raw = await fetch_chart_data(client, artist_id)
         chart_data_str = format_chart_data_for_llm(chart_data_raw)
-        
-        # 5. Construct Final Text Prompt
-        final_prompt = f"""Prompt: Analytical Overview of {artist_name}'s Auction Milestones
-[Data Input Block: GraphQL Source]
-Instructions for AI: Use the structured data below to populate the article.
 
-Hyperlinks: Embed the viewAt URL into the artwork title in each Lot Header.
+        # 5. Inject reliable metadata
+        now = datetime.now(timezone.utc)
+        generated_at = now.isoformat()
+        publication_date = now.strftime("%B %d, %Y")
 
-Provenance: Extract only the single most prestigious owner/gallery from the provenance string.
+        # 6. Build the JSON schema example to show Grok the exact shape
+        json_schema = f"""{{
+  "meta": {{
+    "artist_id": "{artist_id}",
+    "artist_name": "<full artist name from data>",
+    "generated_at": "{generated_at}",
+    "publication_date": "{publication_date}"
+  }},
+  "header": {{
+    "title": "<{artist_name}'s 5 Most Expensive Works: your subtitle here>",
+    "deck": "<40-60 word qualitative summary, no numbers or years>"
+  }},
+  "lead": "<100-150 word introduction paragraph, no numbers or prices>",
+  "lots": [
+    {{
+      "rank": 1,
+      "title": "<artwork title>",
+      "url": "<full mutualart URL from viewAt field>",
+      "year_created": "<creation year as string>",
+      "price_usd": 104168000,
+      "price_display": "$104,168,000",
+      "auction_house": "<auction house name and city>",
+      "sale_year": 2004,
+      "narrative": "<descriptive paragraph on technique and significance>",
+      "provenance": "<single most prestigious past owner only>",
+      "exhibition": "<primary venue and year e.g. MoMA New York 1957>"
+    }}
+  ],
+  "conclusion": {{
+    "heading": "{artist_name}'s Market Legacy: An Enduring Ascent",
+    "body": "<concise turnover analysis referencing spike years and dollar thresholds>"
+  }}
+}}"""
 
-Exhibition: Extract only the primary museum/gallery name and year from exhibitionHistory.
+        # 7. Final prompt
+        final_prompt = f"""You are a precise editorial AI for MutualArt.
+Using the auction data provided below, write a sophisticated 800-1000 word analytical article.
 
-Market Context: Reference the provided "Artist Auction Market Data" below to identify specific years where total sales crossed major thresholds (e.g., $120m, $240m, or $360m).
-
-Active Data:
-
+[SOURCE DATA]
+Artist Auction Records:
 {context_str}
 
-Chart Data:
-
+Artist Market Turnover Chart:
 {chart_data_str}
 
-[Editorial Instructions]
-Objective: Write an 800–1000 word article for MutualArt analyzing the artist’s 5 most expensive works.
+[EDITORIAL RULES]
+- Title: "{artist_name}'s 5 Most Expensive Works: [your subtitle]"
+- Deck: 40-60 word qualitative summary of thematic essence and scarcity. No numbers or years.
+- Lead: 100-150 word introduction. Focus on the artist as a progenitor of their movement.
+  Contrast rarity of major oils with traded prints. No numbers, prices, or data points.
+- Lots: For each of the 5 works write a narrative paragraph using the lot essay details.
+  Provenance: extract only the single most prestigious past owner.
+  Exhibition: extract only primary venue and year.
+  No literature, bibliographies, long exhibition lists, or page numbers.
+- Conclusion heading: "{artist_name}'s Market Legacy: An Enduring Ascent"
+  Conclusion body: Identify spike years from turnover data, anchor to specific dollar thresholds. Keep concise.
+- Tone: Simple. No em-dashes.
 
-Header & Lead (The "Munch" Standard):
+[OUTPUT FORMAT]
+Output ONLY a single valid JSON object. No markdown code fences. No text before or after the JSON.
+Include all 5 lots as separate objects in the "lots" array.
+Follow this exact schema:
 
-Main Title: {artist_name}’s 5 Most Expensive Works: [Subtitle]
+{json_schema}"""
 
-Deck (Italicized): A 40–60 word qualitative summary of the artist’s thematic essence and scarcity. Strictly no numbers or years.
-
-Publication: MutualArt | [Current Date]
-
-The Lead Paragraph: Write a 100–150 word "Titan of Art" introduction. Focus on the artist as a progenitor of their movement. Contrast the rarity of major oils with traded prints. Discuss the demand as a translation of human experience/anxiety. Strictly no numbers, prices, or data points.
-
-Lot Analysis Rules:
-
-Lot Header Format: [Number]. [Hyperlinked Title], [Year] – [Price] USD. [Auction House], [Sale Year].
-
-Narrative Content: Use the auction house lot essays to provide descriptive, interesting details about technique and significance. It is okay to provide a longer, more detailed description for each painting rather than a long conclusion.
-
-Constraints: * NO literature, bibliographies, or page numbers.
-
-NO long lists of exhibitions; mention only the venue and year.
-
-NO exhaustive provenance; mention only the most significant past owner.
-
-Conclusion:
-
-Heading: {artist_name}’s Market Legacy: An Enduring Ascent
-
-Content: Analyze the turnover chart data from the provided data. Identify the "spike years" where volume peaked and anchor these claims to the specific dollar thresholds reached. Keep this conclusion small and concise.
-
-Formatting:
-
-No em-dashes.
-
-Tone: Simple
-"""
         return final_prompt
