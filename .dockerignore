@@ -12,6 +12,7 @@ env/
 
 # Environment / secrets (injected at runtime by AWS)
 .env
+.env.*
 *.env
 
 # Git
@@ -28,6 +29,13 @@ Thumbs.db
 # Docs and tooling (not needed at runtime)
 README.md
 AGENTS.md
+tests/
+shared/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 
 # Docker itself

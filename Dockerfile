@@ -45,7 +45,11 @@ COPY services/ ./services/
 # at runtime (e.g., AWS ECS Task Definition, EKS, or docker run -e ...).
 # Required variables:
 #   XAI_API_KEY           – xAI / Grok API key
-#   MUTUALART_AUTH_TOKEN  – MutualArt GraphQL authorization token (optional if still hardcoded)
+#   MUTUALART_API_USERNAME – MutualArt API/login username
+#   MUTUALART_API_PASSWORD – MutualArt API/login password
+# Optional:
+#   MUTUALART_TOKEN_URL    – token endpoint (default: https://gql.test.mutualart.com/token)
+#   MUTUALART_VERIFY_SSL   – set true when cert chain is trusted in runtime
 # Example (for local testing only):
 #   docker run -e XAI_API_KEY=<key> -p 8000:8000 mutualart-article-service
 

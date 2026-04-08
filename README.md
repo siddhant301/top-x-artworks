@@ -29,7 +29,7 @@ Project/
 
 ## Prerequisites
 
-- **Python 3.8+** — for local development
+- **Python 3.11+** — recommended locally (matches Docker runtime)
 - **Docker** — for containerised deployment
 - **XAI API Key** — an active key to access Grok models via `xai_sdk`
 
@@ -59,13 +59,42 @@ Core dependencies: `fastapi`, `uvicorn`, `httpx`, `python-dotenv`, `xai_sdk`.
 
 ### 3. Set Environment Variables
 
-Create a `.env` file at the project root:
+For production and staging, do **not** rely on `.env` files. Inject values from shell, container runtime, or AWS Secrets Manager.
+
+**Recommended local testing (production-style, no `.env`):**
+
+```powershell
+# PowerShell
+$env:XAI_API_KEY="your_actual_api_key_here"
+$env:MUTUALART_API_USERNAME="your_mutualart_api_username"
+$env:MUTUALART_API_PASSWORD="your_mutualart_api_password"
+# Optional:
+$env:MUTUALART_TOKEN_URL="https://gql.test.mutualart.com/token"
+$env:MUTUALART_VERIFY_SSL="true"
+```
+
+```bash
+# Mac / Linux
+export XAI_API_KEY="your_actual_api_key_here"
+export MUTUALART_API_USERNAME="your_mutualart_api_username"
+export MUTUALART_API_PASSWORD="your_mutualart_api_password"
+# Optional:
+export MUTUALART_TOKEN_URL="https://gql.test.mutualart.com/token"
+export MUTUALART_VERIFY_SSL="true"
+```
+
+**Local convenience only (optional):** use a `.env` file during development.
 
 ```env
 XAI_API_KEY=your_actual_api_key_here
+MUTUALART_API_USERNAME=your_mutualart_api_username
+MUTUALART_API_PASSWORD=your_mutualart_api_password
+# Optional overrides:
+# MUTUALART_TOKEN_URL=https://gql.test.mutualart.com/token
+# MUTUALART_VERIFY_SSL=true
 ```
 
-> **Note:** Both `XAI_API_KEY` and `MUTUALART_AUTH_TOKEN` must be present. The service will refuse to start if either is missing.
+> **Note:** `XAI_API_KEY`, `MUTUALART_API_USERNAME`, and `MUTUALART_API_PASSWORD` are required.
 
 ### 4. Start the Server
 
@@ -97,6 +126,9 @@ The **multi-stage build** keeps the image lean:
 ```bash
 docker run \
   -e XAI_API_KEY=your_actual_api_key_here \
+  -e MUTUALART_API_USERNAME=your_mutualart_api_username \
+  -e MUTUALART_API_PASSWORD=your_mutualart_api_password \
+  -e MUTUALART_VERIFY_SSL=true \
   -p 8000:8000 \
   mutualart-article-service:latest
 ```
@@ -107,7 +139,12 @@ Pass the following via the **ECS Task Definition** environment block or a **Kube
 | Variable | Description |
 |---|---|
 | `XAI_API_KEY` | xAI / Grok API key |
-| `MUTUALART_AUTH_TOKEN` | MutualArt GraphQL bearer token (once extracted from source) |
+| `MUTUALART_API_USERNAME` | MutualArt API/login username used for session token retrieval |
+| `MUTUALART_API_PASSWORD` | MutualArt API/login password used for session token retrieval |
+| `MUTUALART_TOKEN_URL` *(optional)* | Token endpoint (default: `https://gql.test.mutualart.com/token`) |
+| `MUTUALART_VERIFY_SSL` *(optional)* | TLS verification toggle for environments with private/self-signed cert chains |
+| `MUTUALART_GRANT_TYPE` *(optional)* | OAuth grant type for token request (default: `password`) |
+| `MUTUALART_TOKEN_FALLBACK_TTL_SECONDS` *(optional)* | Fallback token TTL when JWT expiry is missing |
 
 ### 3. Health Check
 
@@ -117,6 +154,8 @@ The `Dockerfile` registers a `HEALTHCHECK` that polls `/health` every 30 s. Veri
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+> If your DevOps standard requires `/health-check`, add an alias endpoint or adjust the platform probe before release.
 
 ### 4. Push to Amazon ECR
 
@@ -197,5 +236,5 @@ The endpoint returns a structured **JSON** object validated against the `Article
 | Symptom | Likely Cause | Fix |
 |---|---|---|
 | `HTTP 500` — API key missing | `XAI_API_KEY` not set | Inject the env var via `.env` (local) or ECS Task Definition (AWS) |
-| `GraphQL Errors: ...` | MutualArt token expired or schema changed | Refresh `AUTH_TOKEN` in `prompt_builder.py` |
+| `GraphQL Errors: ...` | MutualArt login failed, token expired, or schema changed | Verify `MUTUALART_API_USERNAME` / `MUTUALART_API_PASSWORD`; confirm `MUTUALART_TOKEN_URL`; retry request |
 | Container exits immediately | Missing required env var | Run `docker logs <id>` to inspect |

@@ -10,27 +10,77 @@ load_dotenv()
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.chart_data_formatter import format_chart_data_for_llm
+from services.mutualart_auth import get_auth_manager
 
 GRAPHQL_URL = "https://gql.test.mutualart.com/api/graphql"
 
-# Loaded from environment — injected at runtime by AWS (ECS Task Definition / EKS Secret).
-# Never hardcode this value in source code.
-_raw_token = os.environ.get("MUTUALART_AUTH_TOKEN", "")
-if not _raw_token:
-    raise ValueError(
-        "Missing required environment variable: MUTUALART_AUTH_TOKEN. "
-        "Set it in your .env file (local) or in the AWS Task Definition (production)."
-    )
-# Accept the token with or without the 'Bearer ' prefix
-AUTH_TOKEN = _raw_token if _raw_token.startswith("Bearer ") else f"Bearer {_raw_token}"
 
-def get_client() -> httpx.AsyncClient:
-    """Create a configured httpx AsyncClient to reuse connections."""
+async def get_client(force_refresh: bool = False) -> httpx.AsyncClient:
+    """Create a configured httpx AsyncClient with a valid MutualArt token."""
+    auth_manager = get_auth_manager()
     headers = {
-        "Authorization": AUTH_TOKEN,
-        "Content-Type": "application/json"
+        "Authorization": await auth_manager.get_authorization_header(force_refresh=force_refresh),
+        "Content-Type": "application/json",
     }
-    return httpx.AsyncClient(verify=False, headers=headers, timeout=30.0)
+    return httpx.AsyncClient(
+        verify=auth_manager.verify_ssl,
+        headers=headers,
+        timeout=auth_manager.timeout_seconds,
+    )
+
+
+def _is_auth_related_graphql_error(data: dict) -> bool:
+    errors = data.get("errors")
+    if not errors:
+        return False
+
+    if isinstance(errors, list):
+        flattened = " ".join(
+            json.dumps(item, ensure_ascii=False) if not isinstance(item, str) else item for item in errors
+        )
+    else:
+        flattened = str(errors)
+
+    lowered = flattened.lower()
+    auth_markers = (
+        "invalid_token",
+        "authorization",
+        "unauthorized",
+        "forbidden",
+        "not authorized",
+        "jwt",
+        "token",
+    )
+    return any(marker in lowered for marker in auth_markers)
+
+
+async def _refresh_client_auth_header(client: httpx.AsyncClient) -> None:
+    auth_manager = get_auth_manager()
+    client.headers["Authorization"] = await auth_manager.get_authorization_header(force_refresh=True)
+
+
+async def _execute_graphql_request(client: httpx.AsyncClient, query: str, variables: dict) -> dict:
+    for attempt in range(2):
+        response = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables})
+
+        if response.status_code in (401, 403):
+            if attempt == 0:
+                await _refresh_client_auth_header(client)
+                continue
+            response.raise_for_status()
+
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            if attempt == 0 and _is_auth_related_graphql_error(data):
+                await _refresh_client_auth_header(client)
+                continue
+            raise Exception(f"GraphQL Errors: {data['errors']}")
+
+        return data
+
+    raise Exception("GraphQL request failed after one auth refresh retry.")
 
 async def fetch_top_5_expensive(client: httpx.AsyncClient, artist_id):
     """
@@ -49,13 +99,7 @@ async def fetch_top_5_expensive(client: httpx.AsyncClient, artist_id):
         "_artists": [artist_id]
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     artworks = data.get('data', {}).get('artworks', {}).get('data', [])
     return [aw['id'] for aw in artworks]
 
@@ -139,13 +183,7 @@ async def fetch_artwork_details(client: httpx.AsyncClient, artwork_ids):
         "_skip": 0
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     return data.get('data', {}).get('data', {}).get('data', [])
 
 def build_prompt_context(artworks):
@@ -307,20 +345,14 @@ async def fetch_chart_data(client: httpx.AsyncClient, artist_id):
       }
     }
     
-    response = await client.post(GRAPHQL_URL, json={'query': query, 'variables': variables})
-    response.raise_for_status()
-    data = response.json()
-    
-    if 'errors' in data:
-        raise Exception(f"GraphQL Errors: {data['errors']}")
-        
+    data = await _execute_graphql_request(client, query, variables)
     return data
 
 async def build_article_prompt(artist_id):
     """
     Main entry point for generating the prompt text using httpx.AsyncClient for performance.
     """
-    async with get_client() as client:
+    async with await get_client() as client:
         # 1. Fetch Top 5 IDs
         top_ids = await fetch_top_5_expensive(client, artist_id)
         if not top_ids:
